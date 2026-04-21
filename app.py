@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 
@@ -115,6 +116,11 @@ class ContextEngine:
             "is_healthy": is_healthy,
             "scientific_rationale": rationale
         }
+
+@app.get("/", response_class=HTMLResponse)
+def serve_ui():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
 
 @app.post("/optimize-meal")
 async def optimize_meal(request: UserContextRequest) -> Dict[str, Any]:
