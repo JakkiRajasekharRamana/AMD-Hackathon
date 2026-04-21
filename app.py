@@ -1,8 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from functools import lru_cache
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
+
+try:
+    from google.cloud import logging as cloud_logging
+    client = cloud_logging.Client()
+    logger = client.logger("nutriquest_log")
+except Exception:
+    logger = None
 
 app = FastAPI(title="Smart Food & Health Context Engine", version="1.0.0")
 
@@ -14,12 +22,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
 # Models for the stateless API request
 class UserContextRequest(BaseModel):
-    craving: str
-    circadian_rhythm: str  # e.g., "morning", "afternoon", "late_night"
-    cognitive_load: str    # e.g., "low", "medium", "high"
-    metabolic_state: str   # e.g., "fasted", "recent_heavy_meal", "optimal"
+    craving: str = Field(..., max_length=100)
+    circadian_rhythm: str = Field(..., max_length=100)  # e.g., "morning", "afternoon", "late_night"
+    cognitive_load: str = Field(..., max_length=100)    # e.g., "low", "medium", "high"
+    metabolic_state: str = Field(..., max_length=100)   # e.g., "fasted", "recent_heavy_meal", "optimal"
 
 # Mock Data Structure for Cravings and Alternatives
 ALTERNATIVES_DB: Dict[str, List[Dict[str, Any]]] = {
@@ -50,80 +65,98 @@ ALTERNATIVES_DB: Dict[str, List[Dict[str, Any]]] = {
     ]
 }
 
+@lru_cache(maxsize=128)
+def _evaluate_heuristic(matched_key: str, circadian_rhythm: str, cognitive_load: str, metabolic_state: str) -> Dict[str, Any]:
+    alternatives: Optional[List[Dict[str, Any]]] = ALTERNATIVES_DB.get(matched_key)
+    if not alternatives:
+        raise ValueError(f"Craving '{matched_key}' not found in database.")
+
+    best_score: int = -9999
+    best_alternative: Optional[Dict[str, Any]] = None
+    rationale: str = ""
+
+    for alt in alternatives:
+        score: int = 100  # Base score
+        reasons: List[str] = []
+
+        # 1. Circadian Rhythm Heuristics
+        if circadian_rhythm == "late_night":
+            if alt.get("carb_heavy"):
+                score -= 40
+                reasons.append("Heavy carbohydrates late at night disrupt slow-wave sleep.")
+            if alt.get("sugar_spike"):
+                score -= 50
+                reasons.append("Sugary foods before bed spike insulin, interfering with melatonin production.")
+        elif circadian_rhythm == "morning":
+            if alt.get("carb_heavy"):
+                score += 10 # Carbs okay for morning energy
+            
+        # 2. Cognitive Load Heuristics
+        if cognitive_load == "high":
+            if alt.get("omega_3"):
+                score += 30
+                reasons.append("Omega-3 fatty acids reduce neuro-inflammation and support high cognitive demand.")
+            if alt.get("lipid_heavy") and not alt.get("omega_3"):
+                score -= 20
+                reasons.append("Heavy saturated fats can induce sluggishness and cognitive fog.")
+        
+        # 3. Metabolic State Heuristics
+        if metabolic_state == "recent_heavy_meal":
+            if alt.get("carb_heavy") or alt.get("lipid_heavy"):
+                score -= 50
+                reasons.append("Adding dense macronutrients shortly after a heavy meal overwhelms metabolic processing.")
+        elif metabolic_state == "fasted":
+            if alt.get("protein_rich"):
+                score += 20
+                reasons.append("High protein is ideal for breaking a fast to preserve lean body mass.")
+
+        if score > best_score:
+            best_score = score
+            best_alternative = alt
+            if reasons:
+                rationale = " ".join(list(set(reasons)))
+            else:
+                rationale = "This is a balanced alternative that suits your current physiological state."
+
+    # Calculate is_healthy boolean
+    is_healthy: bool = best_score > 80
+
+    return {
+        "recommended_alternative": best_alternative["name"] if best_alternative else "Unknown",
+        "score": best_score,
+        "is_healthy": is_healthy,
+        "scientific_rationale": rationale
+    }
+
 class ContextEngine:
     """Heuristic scoring algorithm for food optimization."""
     
     @staticmethod
     def evaluate(craving_category: str, context: UserContextRequest) -> Dict[str, Any]:
-        alternatives: Optional[List[Dict[str, Any]]] = ALTERNATIVES_DB.get(craving_category.lower())
-        if not alternatives:
-            raise ValueError(f"Craving '{craving_category}' not found in database.")
+        result = _evaluate_heuristic(
+            craving_category.lower(),
+            context.circadian_rhythm,
+            context.cognitive_load,
+            context.metabolic_state
+        ).copy()
+        result["original_craving"] = context.craving
+        return result
 
-        best_score: int = -9999
-        best_alternative: Optional[Dict[str, Any]] = None
-        rationale: str = ""
-
-        for alt in alternatives:
-            score: int = 100  # Base score
-            reasons: List[str] = []
-
-            # 1. Circadian Rhythm Heuristics
-            if context.circadian_rhythm == "late_night":
-                if alt.get("carb_heavy"):
-                    score -= 40
-                    reasons.append("Heavy carbohydrates late at night disrupt slow-wave sleep.")
-                if alt.get("sugar_spike"):
-                    score -= 50
-                    reasons.append("Sugary foods before bed spike insulin, interfering with melatonin production.")
-            elif context.circadian_rhythm == "morning":
-                if alt.get("carb_heavy"):
-                    score += 10 # Carbs okay for morning energy
-                
-            # 2. Cognitive Load Heuristics
-            if context.cognitive_load == "high":
-                if alt.get("omega_3"):
-                    score += 30
-                    reasons.append("Omega-3 fatty acids reduce neuro-inflammation and support high cognitive demand.")
-                if alt.get("lipid_heavy") and not alt.get("omega_3"):
-                    score -= 20
-                    reasons.append("Heavy saturated fats can induce sluggishness and cognitive fog.")
-            
-            # 3. Metabolic State Heuristics
-            if context.metabolic_state == "recent_heavy_meal":
-                if alt.get("carb_heavy") or alt.get("lipid_heavy"):
-                    score -= 50
-                    reasons.append("Adding dense macronutrients shortly after a heavy meal overwhelms metabolic processing.")
-            elif context.metabolic_state == "fasted":
-                if alt.get("protein_rich"):
-                    score += 20
-                    reasons.append("High protein is ideal for breaking a fast to preserve lean body mass.")
-
-            if score > best_score:
-                best_score = score
-                best_alternative = alt
-                if reasons:
-                    rationale = " ".join(list(set(reasons)))
-                else:
-                    rationale = "This is a balanced alternative that suits your current physiological state."
-
-        # Calculate is_healthy boolean
-        is_healthy: bool = best_score > 80
-
-        return {
-            "original_craving": context.craving,
-            "recommended_alternative": best_alternative["name"] if best_alternative else "Unknown",
-            "score": best_score,
-            "is_healthy": is_healthy,
-            "scientific_rationale": rationale
-        }
+try:
+    with open("index.html", "r", encoding="utf-8") as f:
+        INDEX_HTML_CONTENT = f.read()
+except FileNotFoundError:
+    INDEX_HTML_CONTENT = "<html><body>UI not found.</body></html>"
 
 @app.get("/", response_class=HTMLResponse)
 def serve_ui():
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    return INDEX_HTML_CONTENT
 
 @app.post("/optimize-meal")
 async def optimize_meal(request: UserContextRequest) -> Dict[str, Any]:
+    if logger:
+        logger.log_text("API called")
+        
     try:
         craving_key: str = request.craving.lower()
         
